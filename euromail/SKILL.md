@@ -2,13 +2,15 @@
 name: euromail
 description: |
   Add euromail.dev transactional email to any project. Detects tech stack,
-  installs SDK, configures auth, and writes integration code. Includes
-  embeddable signup forms with CSS customization, and agent mailboxes with
-  lease/ack/nack delivery, quote stripping, and intent classification.
+  installs SDK, configures auth, and writes integration code. Also covers SMTP
+  sending, the MCP server, signup forms, and agent mailboxes with
+  lease/ack/nack delivery, quote stripping, intent classification and spam
+  verdicts.
   Use when: "add email", "send emails", "euromail",
   "transactional email", "integrate euromail", "signup form", "subscribe form",
-  "agent mailbox", "inbound email for AI", "email for agent"
-user_invocable: true
+  "agent mailbox", "inbound email for AI", "email for agent", "euromail smtp",
+  "euromail mcp"
+user-invocable: true
 ---
 
 # euromail.dev Integration Skill
@@ -16,10 +18,9 @@ user_invocable: true
 You are integrating euromail.dev — a GDPR-compliant transactional email API with EU data residency (Finland) — into the user's project.
 
 > **For agents without the Claude Code skill system** (Cursor, Windsurf, Copilot, etc.):
-> This file is the complete integration guide. Read it top to bottom and follow
-> the workflow steps. All API reference, SDK examples, and gotchas are in the
-> second half of this file. You do not need any special tooling — just follow
-> the steps using your normal file editing and shell execution capabilities.
+> Read this file top to bottom and follow the workflow steps. SDK examples, limits and
+> gotchas are in the second half, and it says where the full API reference is served.
+> You need no special tooling, only your normal file editing and shell commands.
 
 ## Autonomy principles
 
@@ -47,9 +48,12 @@ Check the project root for these files to determine the stack:
 | `Cargo.toml` | Rust |
 | `requirements.txt` or `pyproject.toml` | Python |
 | `go.mod` | Go |
+| `wp-config.php`, `wp-load.php`, or a `wp-content/` directory | WordPress |
 | `composer.json` | PHP |
 
-If multiple are found, pick the primary one based on the project type (e.g. Rust project with a dashboard `package.json` → Rust). Only ask the user if the stack is genuinely ambiguous.
+If multiple are found, pick the primary one based on the project type (e.g. Rust project with a dashboard `package.json` → Rust). WordPress takes priority over the generic PHP row — a WordPress install gets the official plugin (Step 2), not the raw SDK, even if it also has a `composer.json`. Only ask the user if the stack is genuinely ambiguous.
+
+If the thing that sends mail only has SMTP settings (a CMS, a device, a framework's mailer the user wants to keep), use the SMTP section further down instead of an SDK. Steps 3 to 5 still apply.
 
 ### Step 2: Install SDK
 
@@ -61,7 +65,7 @@ npm install @euromail/sdk
 **Rust** — official crate:
 ```toml
 [dependencies]
-euromail = "0.2"
+euromail = "0.8"
 ```
 
 **Python** — official package:
@@ -74,7 +78,15 @@ pip install euromail
 go get github.com/kalle-works/euromail-go
 ```
 
-**PHP / other** — use raw HTTP with the language's native HTTP client.
+**PHP** — official package via Composer:
+```bash
+composer require euromail/euromail:^1.0
+```
+No `composer.json` in the project? Fall back to raw HTTP with PHP's native HTTP client.
+
+**WordPress** — do not install the SDK directly. Install the official Euromail plugin instead: search "Euromail" under Plugins → Add New in wp-admin if it's live on wordpress.org yet, otherwise install the latest release zip from `https://github.com/kalle-works/euromail-wordpress/releases` (Plugins → Add New → Upload Plugin, or extract into `wp-content/plugins/`). Activate it, then go to **Euromail → Settings** and paste the API key (or define `EUROMAIL_API_KEY` in `wp-config.php`) — this covers Step 3 below. Every `wp_mail()` call — password resets, WooCommerce orders, form notifications — now routes through EuroMail automatically, so there is no integration code to write (skip Step 6). Domain verification (Step 4) still applies — an unverified domain sandboxes every send — and the plugin's own **Euromail → Send Test** page covers Step 5.
+
+**Other languages** — use raw HTTP with the language's native HTTP client.
 
 ### Step 3: Setup API Key
 
@@ -108,7 +120,9 @@ curl -s -o /dev/null -w "%{http_code}" https://api.euromail.dev/v1/account \
   -H "Authorization: Bearer $EUROMAIL_API_KEY"
 ```
 
-Expected: `200`. If `401`, the key is invalid — ask the user to check it.
+- `200`: the key works and has full access.
+- `403` with code `INSUFFICIENT_SCOPE`: the key works but lacks `account:admin`. That is normal for a scoped key. The domain steps below need `domains:manage`, and the test send needs `emails:send`.
+- `401`: read `error.code`. `AUTH_MISSING` means nothing was sent, `AUTH_MALFORMED` means it isn't a key (the placeholder `em_live_...` counts), and `AUTH_INVALID_KEY` means it is mistyped or deleted. Ask the user to check it.
 
 ### Step 4: Add & Verify Sending Domain
 
@@ -119,7 +133,7 @@ Expected: `200`. If `401`, the key is invalid — ask the user to check it.
    curl -s https://api.euromail.dev/v1/domains \
      -H "Authorization: Bearer $EUROMAIL_API_KEY"
    ```
-   If any domain has `verified: true`, use it — no further setup needed, skip to Step 5.
+   A domain whose `verified_at` is set is verified. Use it, no further setup needed, and skip to Step 5. Domains have no `verified` field.
 
 2. Infer from `package.json` → `homepage` field (e.g. `https://app.example.com` → `example.com`)
 
@@ -157,16 +171,16 @@ Save the returned domain `id` and `dns_records` from the response.
 
 **4c. Show DNS records** — present the required DNS records clearly to the user:
 
-The API returns `dns_records` as a dict keyed by purpose (e.g. `dkim`, `return_path`), each with `type`, `host`, and `value` fields. Display them in a table:
+The API returns `dns_records` as a dict keyed by purpose (`dkim`, `spf`, `return_path`, `dmarc`), each with `type`, `host` and `value`. Show the values from the response, not from memory. They look like this:
 
-| Type | Host | Value |
-|------|------|-------|
-| TXT | `euromail._domainkey.domain.com` | `v=DKIM1; k=rsa; p=...` |
-| CNAME | `bounce.domain.com` | `bounce.euromail.dev` |
+| Purpose | Type | Host | Value |
+|---------|------|------|-------|
+| `dkim` | TXT | `euromail._domainkey.em.domain.com` | `v=DKIM1; k=rsa; p=...` |
+| `spf` | TXT | `em.domain.com` | `v=spf1 include:spf.euromail.dev ~all` |
+| `return_path` | MX, priority 10 | `em.domain.com` | `bounce.euromail.dev` |
+| `dmarc` | TXT | `_dmarc.domain.com` | `v=DMARC1; p=none; rua=mailto:dmarc@euromail.dev` |
 
-Also recommend they ensure their domain has:
-- **SPF**: `v=spf1 include:spf.euromail.dev ~all` (or add `include:spf.euromail.dev` to existing SPF record)
-- **DMARC**: `v=DMARC1; p=none; rua=mailto:dmarc@domain.com` (if they don't have one yet)
+Everything except DMARC sits under the `em.` subdomain, so the domain's existing SPF and MX records stay as they are. If the domain already has a DMARC record, keep it rather than adding a second one.
 
 Tell the user: "Add these DNS records at your domain registrar, then tell me when done so I can verify."
 
@@ -181,7 +195,7 @@ Show the verification results. If some checks fail, explain which records are mi
 
 If all critical checks pass (at minimum DKIM + return path), proceed to Step 5. If not, tell the user they can continue in sandbox mode (emails only delivered to account owner's email) and proceed anyway.
 
-**Gotcha — From address is the apex, not the `em.` subdomain.** The DKIM / SPF / return-path records live on `em.their-domain.tld` (euromail's `sending_subdomain`), which looks like it should be the From domain. It isn't — that subdomain is infrastructure, not a registered sender domain. Sending with `from: "noreply@em.their-domain.tld"` returns `Domain 'em.their-domain.tld' is not registered for this account`. Always send from the apex (`from: "noreply@their-domain.tld"`), or from a different subdomain you've explicitly registered as its own euromail domain.
+**Gotcha — From address is the apex, not the `em.` subdomain.** The DKIM / SPF / return-path records live on `em.their-domain.tld` (euromail's `sending_subdomain`), which looks like it should be the From domain. It isn't — that subdomain is infrastructure, not a registered sender domain. Sending with `from: "noreply@em.their-domain.tld"` returns `403 SENDER_DOMAIN_NOT_REGISTERED`. Always send from the apex (`from: "noreply@their-domain.tld"`), or from a different subdomain you've explicitly registered as its own euromail domain.
 
 **4e. (Optional) Enable inbound mail on the domain** — skip unless the user wants to *receive* mail at `user@their-domain.tld` (agent mailboxes bound to the domain, inbound routes, `/v1/inbound`). The send-side DNS from 4a-4d does *not* enable inbound: it only sets up DKIM / SPF / bounce return-path, which is a different MX on a sending subdomain (e.g. `em.their-domain.tld`).
 
@@ -251,14 +265,14 @@ use euromail::{EuroMail, SendEmailParams};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = EuroMail::new(std::env::var("EUROMAIL_API_KEY")?);
 
-    let response = client.send_email(&SendEmailParams {
-        from: "noreply@THEIR_DOMAIN".into(),
-        to: "TEST_RECIPIENT".into(),
-        subject: Some("euromail integration test".into()),
-        html_body: Some("<h1>It works!</h1><p>Your euromail integration is live.</p>".into()),
-        text_body: Some("It works! Your euromail integration is live.".into()),
-        ..Default::default()
-    }).await?;
+    let response = client
+        .send_email(
+            &SendEmailParams::new("noreply@THEIR_DOMAIN", "TEST_RECIPIENT")
+                .subject("euromail integration test")
+                .html_body("<h1>It works!</h1><p>Your euromail integration is live.</p>")
+                .text_body("It works! Your euromail integration is live."),
+        )
+        .await?;
 
     println!("Email sent! ID: {}, Status: {}", response.id, response.status);
     Ok(())
@@ -267,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Run the script immediately. If it succeeds (202 response, status "queued"), the integration is complete.
 
-If the domain is unverified (sandbox mode), the email will only be delivered to the account owner's address — inform the user about this.
+If the domain is unverified (sandbox mode, `"sandbox": true` in the response), the email is only delivered to the account owner's address. Tell the user. A test to any other address fails with `VALIDATION_ERROR` until the domain is verified.
 
 ### Step 6: Write Integration Code
 
@@ -276,7 +290,8 @@ Generate an email service module appropriate for the stack. Use the examples and
 The module should include:
 - Client initialization from environment variable
 - A `sendEmail` / `send_email` function wrapping the SDK call
-- Error handling for common API errors (401, 422, 429)
+- Error handling that branches on `error.code`, not on the message: fix-the-request errors (`VALIDATION_ERROR`, `RECIPIENT_SUPPRESSED`, `SENDER_DOMAIN_NOT_REGISTERED`) must not be retried, and `RATE_LIMIT_EXCEEDED` and `QUOTA_EXCEEDED` wait for `retry-after`. The Errors section has the table.
+- An `idempotency_key` on sends a caller might retry, so a retry cannot send twice.
 
 ### Step 7: Cleanup & Next Steps
 
@@ -296,6 +311,7 @@ Then ask if they need:
 - Email validation
 - Analytics integration
 - Inbound email handling (basic routes + webhooks)
+- The MCP server, so an assistant can send and manage email itself
 - Agent mailboxes (dedicated addresses for AI agents with lease/ack/nack delivery, intent classification, and threading). Two deployment shapes: bind the mailbox directly to the user's verified domain (`support@their-domain.tld`, clean, needs inbound MX on that domain — see Step 4e), or keep it on `@inbound.euromail.dev` and add an inbound route that forwards `something@their-domain.tld` → mailbox (no custom MX on the user's domain for the mailbox itself, but the *route*'s domain still needs MX). Prefer the first when practical.
 
 Generate additional code as needed using the API reference below.
@@ -307,852 +323,295 @@ Generate additional code as needed using the API reference below.
 - **Dashboard**: https://dashboard.euromail.dev
 - **API keys**: https://dashboard.euromail.dev/api-keys
 - **Default from**: `noreply@{verified-domain}` or `hello@{verified-domain}`
-- **Sandbox mode**: Unverified domains can only deliver to the account owner's email address.
-- **API key location hint**: Check `$EUROMAIL_API_KEY` env var, project `.env`, or `~/.zshrc` before asking.
+- **Sandbox mode**: an unverified domain can only deliver to the account owner's address. The send response says so with `"sandbox": true`.
+- **A new account starts small**: 20 recipients in its first 24 hours, refilling at 2 an hour, and 3,000 a month until an invoice has been paid. A `429` here is the limit working, not a bug. Rate limits are below.
 
 ---
 
-## SDK Usage Examples
+## API reference
+
+This file holds the workflow and what is easy to get wrong. The route list lives with the API, so read it from there instead of from memory:
+
+| What | Where |
+|------|-------|
+| Every route, generated from the server | `https://api.euromail.dev/api-docs/openapi.json` |
+| The reference as one text file | `https://api.euromail.dev/llms-full.txt` |
+| Guides, per feature | `https://euromail.dev/docs/guides/` |
+
+List the routes of one area, for example agent mailboxes:
+
+```bash
+curl -s https://api.euromail.dev/api-docs/openapi.json \
+  | python3 -c "import json,sys; [print(' '.join(sorted(m.upper() for m in v)), p) for p,v in json.load(sys.stdin)['paths'].items() if 'agent-mailboxes' in p]"
+```
+
+**Auth**: `Authorization: Bearer em_live_...` (`X-EuroMail-Api-Key` also works). **Base URL**: `https://api.euromail.dev`.
+
+---
+
+## SDK usage
+
+The examples below are compile-checked against the versions in Step 2. For anything else, each SDK follows the API's operations, so look up the route, then the method in the SDK's types.
 
 ### TypeScript
 
 ```typescript
-import { EuroMail } from "@euromail/sdk";
+import { EuroMail, verifyWebhookSignature } from "@euromail/sdk";
 
-const euromail = new EuroMail({
-  apiKey: process.env.EUROMAIL_API_KEY!,
-});
+const euromail = new EuroMail({ apiKey: process.env.EUROMAIL_API_KEY! });
 
-// Send an email
+// Send
 const sent = await euromail.sendEmail({
   from: "noreply@yourdomain.com",
   to: "user@example.com",
   subject: "Welcome!",
   html_body: "<h1>Hello</h1><p>Welcome aboard.</p>",
+  text_body: "Hello. Welcome aboard.",
 });
-
-console.log(sent.id);     // email ID
-console.log(sent.status); // "queued"
+console.log(sent.id, sent.status); // "queued"
 
 // Send with a template
 await euromail.sendEmail({
   from: "noreply@yourdomain.com",
   to: "user@example.com",
   template_alias: "welcome-email",
-  template_data: { name: "Kalle", plan: "Pro" },
+  template_data: { name: "Ada", plan: "Pro" },
 });
 
-// Send batch (up to 500)
-const batch = await euromail.sendBatch({
+// Batch, up to 500
+await euromail.sendBatch({
   emails: [
     { from: "noreply@yourdomain.com", to: "a@example.com", subject: "Hi A", text_body: "Hello A" },
     { from: "noreply@yourdomain.com", to: "b@example.com", subject: "Hi B", text_body: "Hello B" },
   ],
 });
 
-// Schedule for later
-await euromail.sendEmail({
+// Schedule, up to 30 days ahead, and cancel
+const later = await euromail.sendEmail({
   from: "noreply@yourdomain.com",
   to: "user@example.com",
   subject: "Reminder",
   text_body: "Don't forget!",
-  send_at: "2026-04-01T09:00:00Z",
+  send_at: "2030-04-01T09:00:00Z",
 });
+await euromail.cancelScheduledEmail(later.id);
 
-// Get email detail (includes events)
-const detail = await euromail.getEmail(sent.id);
-console.log(detail.email.status, detail.events.length);
-
-// List emails
-const emails = await euromail.listEmails({ page: 1, per_page: 25 });
-
-// Cancel a scheduled email
-await euromail.cancelScheduledEmail(sent.id);
-
-// Broadcast to a contact list
-await euromail.sendBroadcast({
-  contact_list_id: "list-uuid",
-  from_address: "noreply@yourdomain.com",
-  subject: "Weekly Update",
-  html_body: "<p>News this week...</p>",
-});
-
-// Templates
-const template = await euromail.createTemplate({
-  alias: "welcome",
-  name: "Welcome Email",
-  subject: "Welcome {{ name }}!",
-  html_body: "<p>Hello {{ name }}, welcome to {{ company }}!</p>",
-});
-
-// Domains — dns_records is a dict keyed by purpose (dkim, return_path, etc.)
+// Domain: dns_records is keyed by purpose (dkim, spf, return_path, dmarc)
 const domain = await euromail.addDomain("yourdomain.com");
-console.log(domain.dns_records.dkim.host);  // "euromail._domainkey.yourdomain.com"
-
-// Verify domain — returns checks per record type
 const verification = await euromail.verifyDomain(domain.id);
-console.log(verification.checks.spf?.verified);  // true/false
 
-// Tracking domain
-await euromail.setTrackingDomain(domain.id, "track.yourdomain.com");
-const trackCheck = await euromail.verifyTrackingDomain(domain.id);
-console.log(trackCheck.tracking_check.verified);
-
-// Webhooks — secret returned only on create, store it securely
+// Webhook: the secret comes back only on create, so store it
 const webhook = await euromail.createWebhook({
   url: "https://yourapp.com/webhooks/euromail",
-  events: ["delivered", "bounced", "complained"],
+  events: ["sent", "bounced", "complained"],
 });
-console.log(webhook.secret); // store this for signature verification
+console.log(webhook.secret);
 
-// Contact lists
-const list = await euromail.createContactList({ name: "Newsletter" });
-await euromail.addContact(list.id, { email: "user@example.com" });
-
-// Analytics
-const stats = await euromail.getAnalyticsOverview({ period: "30d" });
-
-// Validate email
-const validation = await euromail.validateEmail("test@example.com");
-console.log(validation.valid, validation.deliverable); // true, "yes"
-
-// API keys
-const key = await euromail.createApiKey({ name: "my-app", scopes: ["emails:send"] });
-console.log(key.key); // store securely, only shown once
-
-// Signup Forms
-const signupForm = await euromail.createSignupForm({
-  list_id: list.id,
-  title: "Subscribe to updates",
-  description: "Weekly news delivered to your inbox.",
-  custom_fields: [
-    { name: "first_name", label: "First Name", type: "text", required: true }
-  ],
-  messages: {
-    submit_button: "Tilaa",
-    email_label: "Sähköpostiosoite",
-    already_subscribed: "Olet jo tilannut tämän listan.",
-  },
-});
-console.log(signupForm.form_url);    // public URL
-console.log(signupForm.embed_code);  // iframe HTML
-
-// Toggle form active/inactive
-await euromail.toggleSignupForm(signupForm.id);
-
-// Newsletters
-const nl = await euromail.createNewsletter({
-  list_id: list.id,
-  subject: "Monthly Update",
-  from_address: "news@yourdomain.com",
-  html_body: "<p>This month...</p>",
-});
-await euromail.sendNewsletter(nl.id);
-
-// Operations — track async operations (broadcasts, newsletter sends)
-const ops = await euromail.listOperations({ page: 1, per_page: 10 });
-
-// Billing
-const plans = await euromail.listPlans();
-const sub = await euromail.getSubscription();
-
-// Agent Mailboxes — dedicated email addresses for AI agents
-const mailbox = await euromail.createAgentMailbox({
-  local_part: "support-bot",
-  display_name: "Support Agent",
-});
-console.log(mailbox.address); // "support-bot@mail.euromail.dev"
-
-// Long-poll for next message (blocks until a message arrives or timeout)
-const next = await euromail.getNextMailboxMessage(mailbox.id, { timeout_secs: 30 });
-if (next) {
-  console.log(next.message.subject);
-  console.log(next.message.text_body_stripped); // quoted history removed
-  console.log(next.message.classification);     // { label: "question", confidence: 0.89 }
-  console.log(next.message.thread_id);          // correlate replies into conversations
-
-  // Process the message, then ack to remove from queue
-  await euromail.ackMailboxMessage(mailbox.id, next.message.id, next.lease_token);
+// Verify a delivery against the raw body, before parsing it
+function isGenuine(rawBody: string, header: string | null, secret: string): boolean {
+  return verifyWebhookSignature(rawBody, header, secret);
 }
 
-// Reply with thread tracking (sets In-Reply-To / References)
-await euromail.replyToMailboxMessage(mailbox.id, next.message.id, {
-  html_body: "<p>Thanks for reaching out! Here's your answer...</p>",
-  text_body: "Thanks for reaching out! Here's your answer...",
-});
+// Agent mailbox: lease a message, work on it, then ack
+const mailbox = await euromail.createMailbox({ local_part: "support-bot", display_name: "Support Agent" });
+console.log(mailbox.address); // support-bot@inbound.euromail.dev
 
-// Search messages
-const results = await euromail.searchMailboxMessages(mailbox.id, { q: "invoice" });
-
-// List threads
-const threads = await euromail.listMailboxThreads(mailbox.id);
+const next = await euromail.waitForNextMessage(mailbox.id);
+if (next) {
+  console.log(next.data.subject, next.data.classification);
+  await euromail.replyToMessage(mailbox.id, next.data.id, { text_body: "Thanks, here is your answer." });
+  await euromail.ackMessage(mailbox.id, next.data.id, next.lease_token);
+}
 ```
 
 ### Rust
 
+`SendEmailParams` is `#[non_exhaustive]`, so build it with `new` and the setters. A struct literal with `..Default::default()` does not compile.
+
 ```rust
 use euromail::{EuroMail, SendEmailParams};
 
-let client = EuroMail::new(std::env::var("EUROMAIL_API_KEY").unwrap());
+let client = EuroMail::from_env(); // reads EUROMAIL_API_KEY, panics if unset
 
-// Send email — returns SendEmailResponse directly
-let response = client.send_email(&SendEmailParams {
-    from: "noreply@yourdomain.com".into(),
-    to: "user@example.com".into(),
-    subject: Some("Welcome!".into()),
-    html_body: Some("<h1>Hello</h1>".into()),
-    ..Default::default()
-}).await?;
+let response = client
+    .send_email(
+        &SendEmailParams::new("noreply@yourdomain.com", "user@example.com")
+            .subject("Welcome!")
+            .html_body("<h1>Hello</h1>")
+            .text_body("Hello"),
+    )
+    .await?;
+println!("{} {}", response.id, response.status);
 
-println!("Email ID: {}", response.id);
-
-// Domains — dns_records is HashMap<String, DnsRecord> with .host field
 let domain = client.add_domain("yourdomain.com").await?;
-if let Some(dkim) = domain.dns_records.get("dkim") {
-    println!("DKIM host: {}", dkim.host);
-}
-
-// Verify domain — returns DomainVerificationResult
 let result = client.verify_domain(&domain.id).await?;
-if let Some(spf) = result.checks.get("spf") {
-    println!("SPF verified: {}, detail: {}", spf.verified, spf.detail);
-}
-
-// Validate email
-let v = client.validate_email("test@example.com").await?;
-println!("Valid: {}, deliverable: {}", v.valid, v.deliverable);
 ```
+
+Verify a webhook with `euromail::verify_webhook_signature(body, header, secret)?`.
 
 ### Python
 
 ```python
 import os
-from euromail import EuroMail
+from euromail import EuroMail, verify_signature
 
 client = EuroMail(api_key=os.environ["EUROMAIL_API_KEY"])
 
-# Send email — returns SendEmailResponse dataclass
+# Note from_address, not from
 response = client.send_email(
     from_address="noreply@yourdomain.com",
     to="user@example.com",
     subject="Welcome!",
-    html_body="<h1>Hello</h1><p>Welcome aboard.</p>",
+    html_body="<h1>Hello</h1>",
+    text_body="Hello",
 )
-print(response.id, response.status)  # uuid, "queued"
+print(response.id, response.status)
 
-# Domains — dns_records is dict[str, DnsRecord] with .host field
 domain = client.add_domain("yourdomain.com")
-print(domain.dns_records["dkim"].host)
-
-# Verify domain — returns DomainVerificationResult
 result = client.verify_domain(domain.id)
-spf = result.checks.get("spf")
-if spf:
-    print(f"SPF: {spf.verified} — {spf.detail}")
 
-# Validate email
-v = client.validate_email("test@example.com")
-print(v.valid, v.deliverable)
+# Verify a webhook against the raw body bytes
+def is_genuine(raw_body: bytes, header: str, secret: str) -> bool:
+    return verify_signature(raw_body, header, secret)
 ```
 
 ### Go
 
 ```go
-package main
+client := euromail.NewClient(os.Getenv("EUROMAIL_API_KEY"))
+ctx := context.Background()
 
-import (
-    "context"
-    "fmt"
-    "os"
-    euromail "github.com/kalle-works/euromail-go"
-)
-
-func main() {
-    client := euromail.NewClient(os.Getenv("EUROMAIL_API_KEY"))
-    ctx := context.Background()
-
-    // Send email
-    resp, err := client.SendEmail(ctx, euromail.SendEmailParams{
-        From:     "noreply@yourdomain.com",
-        To:       "user@example.com",
-        Subject:  euromail.String("Welcome!"),
-        HTMLBody: euromail.String("<h1>Hello</h1>"),
-    })
-    if err != nil { panic(err) }
-    fmt.Println(resp.ID, resp.Status)
-
-    // Domains — DnsRecords is map[string]DnsRecord with .Host field
-    domain, _ := client.AddDomain(ctx, "yourdomain.com")
-    fmt.Println(domain.DnsRecords["dkim"].Host)
-
-    // Verify domain — returns DomainVerificationResult
-    result, _ := client.VerifyDomain(ctx, domain.ID)
-    if spf, ok := result.Checks["spf"]; ok {
-        fmt.Println(spf.Verified, spf.Detail)
-    }
-
-    // Validate email
-    v, _ := client.ValidateEmail(ctx, "test@example.com")
-    fmt.Println(v.Valid, v.Deliverable)
-}
+resp, err := client.SendEmail(ctx, euromail.SendEmailParams{
+	From:     "noreply@yourdomain.com",
+	To:       euromail.ToRecipient("user@example.com"),
+	Subject:  euromail.String("Welcome!"),
+	HTMLBody: euromail.String("<h1>Hello</h1>"),
+	TextBody: euromail.String("Hello"),
+})
 ```
 
-### Raw HTTP (any language)
+Verify a webhook with `euromail.VerifyWebhookSignature(payload, header, secret)`.
+
+### PHP
+
+The client is `EuroMail\Client`; see `https://euromail.dev/docs/guides/sdks/` for its calls. Retries are off unless you pass `max_retries`.
+
+### Raw HTTP
 
 ```bash
 curl -X POST https://api.euromail.dev/v1/emails \
-  -H "Authorization: Bearer em_live_your_api_key" \
+  -H "Authorization: Bearer $EUROMAIL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "from": "noreply@yourdomain.com",
     "to": "user@example.com",
     "subject": "Hello",
-    "html_body": "<p>Hello world</p>"
+    "html_body": "<p>Hello world</p>",
+    "text_body": "Hello world"
   }'
 ```
 
----
+Send the idempotency key as the `idempotency_key` body field; an `Idempotency-Key` header is not read.
 
-## Webhook Signature Verification
+### SMTP
 
-Webhooks are signed with HMAC-SHA256. The secret is returned only at webhook creation — store it securely.
+Use SMTP for anything that has SMTP settings and no code to change. It goes through the same pipeline as the API.
 
-**Header format**: `X-Euromail-Signature: t={unix_timestamp},v1={hex_signature}`
+| Setting | Value |
+|---------|-------|
+| Host | `smtp.euromail.dev` |
+| Port | `587` (STARTTLS) or `465` (TLS) |
+| Username | `apikey`, the literal word |
+| Password | an API key with the `emails:send` scope |
 
-**Additional headers**:
-- `X-Euromail-Event`: Event type (`sent`, `delivered`, `bounced`, `opened`, `clicked`, `complained`, `email.inbound`)
-- `X-Euromail-Attempt`: Retry attempt (1–5)
+### MCP server
 
-**Verification algorithm**:
-1. Parse `t` (timestamp) and `v1` (signature) from header.
-2. Reject if timestamp is older than 5 minutes (replay protection).
-3. Compute: `HMAC-SHA256(secret, "{timestamp}.{raw_request_body}")`.
-4. Compare hex digest to `v1` using constant-time comparison.
+Use this to let an assistant send and manage email itself rather than writing integration code. It needs Node.js 22 or newer.
 
-### TypeScript verification example
-
-```typescript
-import { createHmac, timingSafeEqual } from "crypto";
-
-function verifyWebhook(secret: string, signatureHeader: string, body: string): boolean {
-  const parts = Object.fromEntries(
-    signatureHeader.split(",").map((p) => p.split("=") as [string, string])
-  );
-  const timestamp = parts.t;
-  const signature = parts.v1;
-
-  // Replay protection (5 min)
-  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
-
-  const expected = createHmac("sha256", secret)
-    .update(`${timestamp}.${body}`)
-    .digest("hex");
-
-  return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-}
-```
-
-### Python verification example
-
-```python
-import hmac, hashlib, time
-
-def verify_webhook(secret: str, signature_header: str, body: str) -> bool:
-    parts = dict(pair.split("=", 1) for pair in signature_header.split(","))
-    timestamp = parts["t"]
-    signature = parts["v1"]
-
-    if abs(time.time() - int(timestamp)) > 300:
-        return False
-
-    expected = hmac.new(
-        secret.encode(), f"{timestamp}.{body}".encode(), hashlib.sha256
-    ).hexdigest()
-
-    return hmac.compare_digest(signature, expected)
+```bash
+claude mcp add euromail --env EUROMAIL_API_KEY=em_live_your_key_here -- npx -y @euromail/mcp-server
 ```
 
 ---
 
-## Complete API Reference
+## Webhooks
 
-**Base URL**: `https://api.euromail.dev`
-**Auth header**: `X-EuroMail-Api-Key: em_live_...` (also supports `Authorization: Bearer <key>`)
-**Content-Type**: `application/json`
+**Events**: `sent`, `deferred`, `bounced`, `failed`, `opened`, `clicked`, `complained`, `email.inbound`, `mailbox.message.received`, `account.auto_paused`, `insights.generated`.
 
-### Emails
+Subscribe to `sent` for delivery: it means the recipient's mail server accepted the message. `delivered` is a deprecated alias that is stored as `sent`, and it never fired on its own.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/emails` | Send single email |
-| `POST` | `/v1/emails/batch` | Send batch (up to 500) |
-| `POST` | `/v1/emails/broadcast` | Broadcast to contact list |
-| `GET` | `/v1/emails` | List emails (paginated) |
-| `GET` | `/v1/emails/{id}` | Get email details + events |
-| `POST` | `/v1/emails/{id}/cancel` | Cancel scheduled email |
+**Signature**: `X-Euromail-Signature: t={unix_timestamp},v1={hex}`, where `v1` is `HMAC-SHA256(secret, "{t}.{raw_body}")`. Use the SDK's helper above where there is one. By hand: compare in constant time, reject a timestamp more than 5 minutes off, accept any `v1` in the header since a rotating secret can carry two, and hash the raw bytes before parsing the JSON.
 
-**Send email request body**:
-```json
-{
-  "from": "sender@yourdomain.com",
-  "to": "recipient@example.com",
-  "cc": [],
-  "bcc": [],
-  "reply_to": "reply@yourdomain.com",
-  "subject": "Subject line",
-  "html_body": "<p>HTML content</p>",
-  "text_body": "Plain text fallback",
-  "template_alias": "welcome-email",
-  "template_data": { "name": "Kalle" },
-  "headers": { "X-Custom": "value" },
-  "tags": ["onboarding"],
-  "metadata": { "user_id": "123" },
-  "attachments": [
-    {
-      "filename": "report.pdf",
-      "content_type": "application/pdf",
-      "content": "base64-encoded-content"
-    }
-  ],
-  "idempotency_key": "unique-key-123",
-  "send_at": "2026-04-01T09:00:00Z"
-}
-```
+**Delivery**: `X-Euromail-Event` names the event and `X-Euromail-Attempt` counts from 1. A `4xx` from your endpoint is treated as permanent and not retried, so answer `5xx` for anything you want again.
 
-Required: `from`, `to`. Must provide `subject` + (`html_body` or `text_body`), or `template_alias`.
+---
 
-**Send email response** (202 Accepted):
-```json
-{
-  "data": {
-    "id": "uuid",
-    "message_id": "<uuid@euromail.dev>",
-    "status": "queued",
-    "to": "recipient@example.com",
-    "sandbox": false,
-    "scheduled_at": null,
-    "created_at": "2026-03-29T10:00:00Z"
-  }
-}
-```
+## Inbound and agent mailboxes
 
-**Get email response** — returns nested email + events:
-```json
-{
-  "data": {
-    "email": { "id": "...", "from_address": "...", "to_address": "...", "status": "..." },
-    "events": [{ "event_type": "sent", "created_at": "..." }]
-  }
-}
-```
-
-### Templates (MiniJinja syntax)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/templates` | Create template |
-| `GET` | `/v1/templates` | List templates |
-| `GET` | `/v1/templates/{id}` | Get template |
-| `PUT` | `/v1/templates/{id}` | Update template |
-| `DELETE` | `/v1/templates/{id}` | Delete template |
-
-Template syntax uses **MiniJinja** (Jinja2-compatible): `{{ variable }}`, `{% if %}`, `{% for %}`, `{{ value | upper }}`.
-
-### Domains
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/domains` | Add domain |
-| `GET` | `/v1/domains` | List domains |
-| `GET` | `/v1/domains/{id}` | Get domain + DNS records |
-| `POST` | `/v1/domains/{id}/verify` | Verify DNS (SPF, DKIM, DMARC, return path, MX) |
-| `DELETE` | `/v1/domains/{id}` | Delete domain |
-| `PUT` | `/v1/domains/{id}/tracking-domain` | Set vanity tracking domain |
-| `POST` | `/v1/domains/{id}/verify-tracking` | Verify tracking CNAME |
-| `DELETE` | `/v1/domains/{id}/tracking-domain` | Remove tracking domain |
-
-### Webhooks
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/webhooks` | Create webhook (returns secret) |
-| `GET` | `/v1/webhooks` | List webhooks |
-| `GET` | `/v1/webhooks/{id}` | Get webhook |
-| `PUT` | `/v1/webhooks/{id}` | Update webhook |
-| `DELETE` | `/v1/webhooks/{id}` | Delete webhook |
-| `POST` | `/v1/webhooks/{id}/test` | Send test event (5/min limit) |
-
-**Events**: `sent`, `delivered`, `bounced`, `opened`, `clicked`, `complained`, `email.inbound`, `mailbox.message.received`
-
-### Suppressions
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/suppressions` | Add suppression |
-| `GET` | `/v1/suppressions` | List suppressions |
-| `DELETE` | `/v1/suppressions/{email}` | Remove suppression |
-
-### Contact Lists
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/contact-lists` | Create list |
-| `GET` | `/v1/contact-lists` | List all |
-| `GET` | `/v1/contact-lists/{id}` | Get list |
-| `PUT` | `/v1/contact-lists/{id}` | Update list |
-| `DELETE` | `/v1/contact-lists/{id}` | Delete list |
-| `POST` | `/v1/contact-lists/{id}/contacts` | Add contacts |
-| `GET` | `/v1/contact-lists/{id}/contacts` | List contacts |
-| `DELETE` | `/v1/contact-lists/{id}/contacts/{email}` | Remove contact |
-
-### Signup Forms
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/signup-forms` | Create signup form for a contact list |
-| `GET` | `/v1/signup-forms` | List all signup forms |
-| `GET` | `/v1/signup-forms/{id}` | Get signup form details |
-| `PUT` | `/v1/signup-forms/{id}` | Update signup form |
-| `DELETE` | `/v1/signup-forms/{id}` | Delete signup form |
-| `POST` | `/v1/signup-forms/{id}/toggle` | Toggle active/inactive |
-
-**Create signup form request body**:
-```json
-{
-  "list_id": "contact-list-uuid",
-  "title": "Subscribe to our newsletter",
-  "description": "Get weekly updates delivered to your inbox.",
-  "success_message": "Thank you for subscribing!",
-  "redirect_url": "https://yoursite.com/thank-you",
-  "custom_fields": [
-    { "name": "first_name", "label": "First Name", "type": "text", "required": true }
-  ],
-  "messages": {
-    "submit_button": "Tilaa",
-    "email_label": "Sähköpostiosoite",
-    "email_placeholder": "sinun@esimerkki.fi",
-    "submitting": "Lähetetään…",
-    "already_subscribed": "Olet jo tilannut tämän listan.",
-    "confirmation_sent": "Lähetimme vahvistussähköpostin.",
-    "confirmation_pending": "Vahvistussähköposti on jo lähetetty.",
-    "invalid_email": "Syötä kelvollinen sähköpostiosoite.",
-    "error": "Jokin meni pieleen. Yritä uudelleen."
-  }
-}
-```
-
-Required: `list_id`, `title`. Scope: `contacts:manage`.
-
-The `messages` field allows full localization of all form UI text. Omit any key to use the English default. The embed.js widget includes minimal default styles that work out-of-the-box.
-
-**Response** includes computed fields:
-```json
-{
-  "data": {
-    "id": "uuid",
-    "slug": "newsletter-a1b2c3",
-    "form_url": "https://api.euromail.dev/subscribe/newsletter-a1b2c3",
-    "embed_code": "<iframe src=\"...\" ...></iframe>",
-    "is_active": true,
-    ...
-  }
-}
-```
-
-#### Public subscribe endpoints (no auth required)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/subscribe/{slug}` | Render standalone signup form page |
-| `POST` | `/subscribe/{slug}` | Submit subscription (form or JSON) |
-| `GET` | `/subscribe/{slug}/embed.js` | JavaScript embed widget |
-| `GET` | `/confirm/{token}` | Confirm double opt-in subscription |
-
-#### Embeddable JavaScript widget
-
-The recommended way to embed a signup form is with the JS widget. It renders directly in the customer's DOM so their own CSS applies:
-
-```html
-<div id="euromail-form"></div>
-<script src="https://api.euromail.dev/subscribe/{slug}/embed.js"></script>
-```
-
-**CSS classes for styling** (all prefixed `em-` to avoid collisions):
-
-| Class | Element |
-|-------|---------|
-| `.em-form` | Form wrapper |
-| `.em-form__title` | h2 title |
-| `.em-form__description` | Description paragraph |
-| `.em-form__field` | Field wrapper (label + input) |
-| `.em-form__label` | Input label |
-| `.em-form__input` | Text/email input |
-| `.em-form__button` | Submit button |
-| `.em-form__message` | Success/error message |
-| `.em-form__message--success` | Success state |
-| `.em-form__message--error` | Error state |
-| `.em-form__powered` | "Powered by EuroMail" link |
-
-Example styling:
-```css
-.em-form__input {
-  border: 1px solid #333;
-  border-radius: 4px;
-  padding: 0.75rem;
-  font-size: 1rem;
-}
-.em-form__button {
-  background: #0d9488;
-  color: white;
-  border-radius: 4px;
-}
-```
-
-The widget submits via `fetch()` with JSON responses — no page reload.
-
-### Analytics
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/analytics/overview` | Summary stats |
-| `GET` | `/v1/analytics/timeseries` | Daily timeseries |
-| `GET` | `/v1/analytics/domains` | Stats by recipient domain |
-| `GET` | `/v1/analytics/export` | Export CSV |
-
-Query params: `period` (`7d`, `30d`, `90d`), `from` (YYYY-MM-DD), `to` (YYYY-MM-DD).
-
-### Inbound Emails
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/inbound` | List inbound emails |
-| `GET` | `/v1/inbound/{id}` | Get inbound email |
-| `DELETE` | `/v1/inbound/{id}` | Delete inbound email |
-
-### Inbound Routes
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/inbound-routes` | Create route |
-| `GET` | `/v1/inbound-routes` | List routes |
-| `GET` | `/v1/inbound-routes/{id}` | Get route |
-| `PUT` | `/v1/inbound-routes/{id}` | Update route |
-| `DELETE` | `/v1/inbound-routes/{id}` | Delete route |
-
-**Create request body**:
-```json
-{
-  "domain_id": "uuid-of-euromail-domain",
-  "pattern": "support@",
-  "match_type": "exact",
-  "action": "mailbox",
-  "mailbox_id": "uuid-of-agent-mailbox"
-}
-```
-
-Exact-match patterns must end with `@` (e.g. `"support@"` matches `support@<domain>`) — a bare local part like `"support"` fails validation with "Exact match pattern must end with '@'". The domain must have `mx_verified = true` before you can create routes on it.
-
-**When to use an inbound route vs. a domain-bound agent mailbox**: if the goal is just "deliver `foo@user-domain.tld` into a mailbox queue," create the mailbox directly with `domain_id` set to that verified domain — no route needed. Use a route when you want many addresses to fan into one mailbox, forward to a webhook, or keep the mailbox on `@inbound.euromail.dev` while presenting a vanity address on the user's domain.
-
-**Route deletion note**: deleting a mailbox does not cascade to routes targeting it. Delete routes first, then the mailbox, or `GET /v1/inbound-routes` and clean up dangling `mailbox_id`s afterwards.
-
-### Agent Mailboxes
-
-Agent mailboxes give each AI agent or workflow a dedicated email address. By default the address is `<local_part>@inbound.euromail.dev`; pass `domain_id` pointing at a domain with `mx_verified = true` and `inbound_enabled = true` to bind the mailbox to the user's own domain instead (`<local_part>@their-domain.tld`). Inbound replies land in a queue with at-least-once delivery via lease/ack/nack. Each message is automatically classified by intent (interested, question, unsubscribe, etc.) when the account has an Anthropic API key configured at `/settings/integrations`.
-
-**Create request body**:
-```json
-{
-  "local_part": "support",
-  "domain_id": "uuid-of-verified-domain",
-  "display_name": "Support Agent"
-}
-```
-
-The only valid domain field is `domain_id` (a UUID). A plain string `domain` is accepted but silently ignored — the returned mailbox still lives on `inbound.euromail.dev`. `address` is also silently ignored — the server generates `mb-<hex>@inbound.euromail.dev`. If `domain_id` points at a domain whose MX is not verified yet, the API returns `Domain must have MX verified and inbound enabled` — fix the DNS first, then retry.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/agent-mailboxes` | Create mailbox |
-| `GET` | `/v1/agent-mailboxes` | List mailboxes |
-| `GET` | `/v1/agent-mailboxes/{id}` | Get mailbox |
-| `DELETE` | `/v1/agent-mailboxes/{id}` | Delete mailbox |
-| `GET` | `/v1/agent-mailboxes/{id}/messages/next` | Long-poll next message (leases it) |
-| `POST` | `/v1/agent-mailboxes/{id}/messages/{msg}/ack` | Acknowledge |
-| `POST` | `/v1/agent-mailboxes/{id}/messages/{msg}/nack` | Return to queue |
-| `GET` | `/v1/agent-mailboxes/{id}/messages` | List messages (?status=all\|unread\|read) |
-| `DELETE` | `/v1/agent-mailboxes/{id}/messages/{msg}` | Delete message |
-| `POST` | `/v1/agent-mailboxes/{id}/messages/{msg}/reply` | Reply with thread tracking |
-| `GET` | `/v1/agent-mailboxes/{id}/messages/{msg}/attachments` | Pre-signed download URLs |
-| `PUT` | `/v1/agent-mailboxes/{id}/messages/{msg}/labels` | Set labels |
-| `GET` | `/v1/agent-mailboxes/{id}/messages/search` | Full-text search |
-| `GET` | `/v1/agent-mailboxes/{id}/threads` | List threads |
-| `GET` | `/v1/agent-mailboxes/{id}/threads/{tid}` | Thread messages |
-| `GET` | `/v1/agent-mailboxes/{id}/contacts` | Unique contacts |
-| `GET` | `/v1/agent-mailboxes/{id}/analytics` | Summary stats |
-| `PATCH` | `/v1/agent-mailboxes/{id}/auto-responder` | Configure auto-responder |
-
-**Lease/ack flow** — long-poll returns one message with a `lease_token` (5 min TTL). Process the message, then ack. If your worker crashes, the lease expires and the message becomes available again. Nack returns it immediately.
-
-**`mailbox.message.received` webhook payload**:
-```json
-{
-  "event": "mailbox.message.received",
-  "mailbox_id": "uuid",
-  "message": {
-    "id": "uuid",
-    "from": "Alice <alice@example.com>",
-    "reply_to": null,
-    "subject": "Re: Help with my order",
-    "text_body": "Thanks, that worked!\n\nOn Mon...",
-    "text_body_stripped": "Thanks, that worked!",
-    "html_body": "<p>Thanks, that worked!</p>...",
-    "attachments": [],
-    "message_id": "<abc@example.com>",
-    "in_reply_to": "<def@euromail.dev>",
-    "references": "<def@euromail.dev> <ghi@euromail.dev>",
-    "thread_id": "uuid",
-    "classification": { "label": "interested", "confidence": 0.92 },
-    "received_at": "2026-04-15T10:01:23Z"
-  },
-  "source_ip": "1.2.3.4",
-  "timestamp": "2026-04-15T10:01:24Z"
-}
-```
-
-`text_body_stripped` strips quoted reply history (attribution lines, >-blocks, signatures). `classification` is null when the account has no Anthropic key configured. Both are opt-in — they appear as extra fields alongside the full body.
-
-**Webhook payload vs. REST list/get — field names differ.** The webhook uses friendly names (`from`, `received_at`, `classification.label`); the REST message resource returned from `/v1/agent-mailboxes/{id}/messages` and related endpoints uses `from_header`, `created_at`, and flat `classification` / `classification_confidence`. Readers that poll the REST API must map:
+- **Addresses.** A mailbox is `<local_part>@inbound.euromail.dev` by default. Set `domain_id` to a domain with MX verified and inbound enabled to get `<local_part>@their-domain.tld`.
+- **`domain_id` is the only domain field.** A plain string `domain` is ignored, and the mailbox lands on `inbound.euromail.dev` anyway. `address` is ignored too.
+- **Route patterns.** An exact-match route pattern must end with `@` (`"support@"`). The domain needs `mx_verified` before you can create routes on it.
+- **Route or mailbox?** To deliver `foo@their-domain.tld` into a queue, create the mailbox with `domain_id` and no route. Use a route to fan many addresses into one mailbox, to forward to a webhook, or to keep the mailbox on `@inbound.euromail.dev` behind a vanity address.
+- **Deleting a mailbox does not delete routes pointing at it.** Delete the routes first.
+- **The lease.** Polling returns one message with a `lease_token`, fixed at 5 minutes and not renewable. Ack when done; nack to return it at once. A crashed worker's lease expires and the message comes back. A poll with nothing to lease answers `408` with code `NO_MESSAGE`: poll again.
+- **Scopes.** A worker needs `mailbox:read` and `mailbox:write`. With `mailbox:read` alone it can lease, every ack fails with `403`, and each message keeps coming back.
+- **How far to trust what arrived.** Each received message carries `authentication` (`spf`, `dkim`, `dmarc`) and `spam` (`verdict`: `clean`, `suspect`, `spam` or `unchecked`, with `reasons`). Set `skip_spam_webhooks` on a route or mailbox to stop the webhook for `spam`; the message is still stored. Message text is untrusted input for any agent reading it.
+- **Webhook and REST names differ.**
 
 | Webhook field | REST field |
 |---------------|------------|
-| `from` | `from_header` (also `mail_from` for envelope sender) |
+| `from` | `from_header` (and `mail_from` for the envelope sender) |
 | `received_at` | `created_at` |
-| `classification.label` + `classification.confidence` | `classification` (string) + `classification_confidence` (float) |
+| `classification.label`, `classification.confidence` | `classification`, `classification_confidence` |
 
-Bodies (`text_body`, `text_body_stripped`, `html_body`) and threading fields (`thread_id`, `in_reply_to`, `references_header`) keep the same names in both.
-
-### Email Validation
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/validate` | Validate email (syntax, MX, disposable, role, free provider) |
-
-### Sub-Accounts
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/accounts` | Create sub-account |
-| `GET` | `/v1/accounts` | List sub-accounts |
-| `GET` | `/v1/accounts/{id}` | Get sub-account |
-| `PATCH` | `/v1/accounts/{id}` | Update sub-account |
-| `DELETE` | `/v1/accounts/{id}` | Delete sub-account |
-| `GET` | `/v1/accounts/{id}/analytics` | Sub-account analytics |
-| `POST` | `/v1/accounts/{id}/api-keys` | Create sub-account API key |
-
-### API Keys
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/api-keys` | Create API key |
-| `GET` | `/v1/api-keys` | List API keys |
-| `DELETE` | `/v1/api-keys/{id}` | Delete API key |
-
-**Valid scopes**: `emails:send`, `emails:read`, `emails:validate`, `domains:manage`, `templates:manage`, `webhooks:manage`, `contacts:manage`, `account:admin`, `sub_accounts:manage`. Omit scopes for full access.
-
-### Account & GDPR
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/account` | Get account details |
-| `DELETE` | `/v1/account` | Delete account (GDPR) |
-| `GET` | `/v1/account/export` | Export all data (GDPR) |
-
-### Newsletters
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/newsletters` | Create newsletter |
-| `GET` | `/v1/newsletters` | List newsletters |
-| `GET` | `/v1/newsletters/{id}` | Get newsletter |
-| `PUT` | `/v1/newsletters/{id}` | Update newsletter |
-| `DELETE` | `/v1/newsletters/{id}` | Delete newsletter |
-| `POST` | `/v1/newsletters/{id}/send` | Send newsletter |
-
-### Operations
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/operations` | List async operations |
-| `GET` | `/v1/operations/{id}` | Get operation status |
-
-### GDPR (per-email)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/gdpr/export?email={email}` | Export all data for an email address |
-| `DELETE` | `/v1/gdpr/erase?email={email}` | Erase all data for an email address |
-
-### Audit Logs
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/audit-logs` | List audit logs |
-
-### Dead Letters
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/dead-letters` | List dead letters |
-| `POST` | `/v1/dead-letters/{id}/retry` | Retry dead letter |
-| `DELETE` | `/v1/dead-letters/{id}` | Delete dead letter |
-
-### Billing
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/billing/plans` | List plans (public) |
-| `GET` | `/v1/billing/subscription` | Get subscription |
-| `POST` | `/v1/billing/checkout` | Create Stripe checkout |
-| `POST` | `/v1/billing/portal` | Create Stripe portal |
+Bodies (`text_body`, `text_body_stripped`, `html_body`) keep their names in both. `classification` is null unless the account has an Anthropic API key configured under `/settings/integrations`.
 
 ---
 
-## Limits & Constraints
+## API key scopes
+
+`emails:send`, `emails:read`, `emails:validate`, `domains:manage`, `templates:manage`, `webhooks:manage`, `contacts:manage`, `mailbox:read`, `mailbox:write`, `mailbox:admin`, `account:admin`, `sub_accounts:manage`. Omit scopes for full access. For an application that only sends, `emails:send` is enough.
+
+---
+
+## Limits
 
 | Constraint | Value |
 |------------|-------|
-| Max request body | 2 MB |
-| Max html_body / text_body | 256 KB each |
-| Max subject | 998 characters |
-| Max recipients (TO+CC+BCC) | 50 per email |
-| Max tags | 10 per email, 256 chars each |
-| Max attachments | 10 per email |
-| Max attachment size | 10 MB per file |
-| Max total attachments | 25 MB |
-| Max batch size | 500 emails |
-| Max scheduled ahead | 30 days |
-| Blocked attachment types | .exe, .bat, .cmd, .scr, .com, .msi, .js, .vbs, .ws, .ps1 |
-| Idempotency key max length | 255 characters |
-| Template alias | alphanumeric + hyphens/underscores, max 100 chars |
-| Pagination default | 25 per page |
-| Pagination max | 100 per page |
+| Request body | 2 MB |
+| `html_body` / `text_body` | 256 KB each |
+| Subject | 998 characters |
+| Recipients (to + cc + bcc) | 50 per email |
+| Tags | 10 per email, 256 characters each |
+| Attachments | 10 per email, 10 MB each, 25 MB in all, and the request body limit applies |
+| Blocked attachment types | `.exe`, `.bat`, `.cmd`, `.scr`, `.com`, `.msi`, `.js`, `.vbs`, `.ws`, `.ps1` |
+| Batch | 500 emails |
+| Scheduled ahead | 30 days |
+| Idempotency key | 255 characters |
+| Template alias | letters, digits, hyphens and underscores, 100 characters |
+| Pagination | 25 per page by default, 100 at most |
 
-### Rate Limits
+Every attachment is also scanned for viruses. A refused one rejects the whole send with `ATTACHMENT_REFUSED`, and a scanner that cannot answer gives `503 ATTACHMENT_SCAN_UNAVAILABLE` with `retry-after`: retry the whole request.
 
-| Scope | Limit |
+### Rate limits
+
+| Limit | Value |
 |-------|-------|
-| Global | 500 req/s |
-| Per account | 50 req/s |
-| New accounts (first 7 days) | 50/min, 500/hour |
-| After 7 days | 200/min, 2000/hour |
-| Webhook tests | 5/min per webhook |
+| Whole API | 500 requests a second |
+| Per account | 50 requests a second |
+| Send rate, first 24 hours | 5 emails a minute, 25 an hour |
+| Send rate, days 2 to 7 | 15 a minute, 75 an hour |
+| Send rate, from day 8 | 100 a minute, 500 an hour |
+| Send rate, once a paid invoice has settled | a tenth of the plan's monthly allowance per hour, a tenth of that per minute |
+| New-account allowance | 20 recipients, refilling at 2 an hour, for the first 24 hours (1,000 once an invoice is paid) |
+| Monthly allowance | the plan's volume; 3,000 until a non-zero invoice has been paid |
+| Webhook tests | 5 a minute per webhook |
 
-**Rate limit headers**: `x-ratelimit-limit`, `x-ratelimit-remaining`, `retry-after` (on 429).
+Sandbox sends skip the send rate and the new-account allowance. In a batch, an email refused by these limits is listed in `errors` and `rate_limited` with `retry_after_seconds`, and the rest of the batch goes through.
 
 ---
 
-## Error Responses
+## Errors
 
 ```json
 {
@@ -1164,25 +623,18 @@ Bodies (`text_body`, `text_body_stripped`, `html_body`) and threading fields (`t
 }
 ```
 
-| HTTP | Type | Code |
-|------|------|------|
-| 401 | `unauthorized` | `UNAUTHORIZED` |
-| 403 | `forbidden` | `FORBIDDEN` |
-| 403 | `permission_error` | `INSUFFICIENT_SCOPE` |
-| 404 | `not_found` | `NOT_FOUND` |
-| 409 | `conflict` | `CONFLICT` |
-| 422 | `validation_error` | `VALIDATION_ERROR` |
-| 429 | `rate_limited` | `RATE_LIMIT_EXCEEDED` |
-| 429 | `quota_exceeded` | `QUOTA_EXCEEDED` |
-| 500 | `internal_error` | `INTERNAL_ERROR` |
+Branch on `code`: it is stable. `message` is for people and can change. Some errors add `docs_url`. The full table with retry advice is at `https://euromail.dev/docs/guides/errors-and-rate-limits/`.
 
-Batch responses include partial success:
-```json
-{
-  "operation_id": "uuid",
-  "data": [ /* successful emails */ ],
-  "errors": [
-    { "index": 2, "error": "Invalid email address" }
-  ]
-}
-```
+| HTTP | `code` | Do |
+|------|--------|----|
+| 401 | `AUTH_MISSING`, `AUTH_MALFORMED`, `AUTH_INVALID_KEY` | Fix the key. The placeholder `em_live_...` is `AUTH_MALFORMED`. |
+| 403 | `INSUFFICIENT_SCOPE` | Use a key with the scope the message names. |
+| 403 | `SENDER_DOMAIN_NOT_REGISTERED` | Add the `from` domain. A subdomain is a separate domain. |
+| 403 | `ACCOUNT_SUSPENDED`, `ACCOUNT_UNDER_REVIEW`, `CARD_VERIFICATION_REQUIRED` | Tell the user. Retrying will not help. |
+| 408 | `NO_MESSAGE` | Mailbox long poll: poll again. |
+| 409 | `CONFLICT` | It already exists. |
+| 422 | `VALIDATION_ERROR` | Fix the request. This is also how an unverified domain sending to someone else is refused. |
+| 422 | `RECIPIENT_SUPPRESSED` | The address bounced, complained or unsubscribed. Do not retry; the body has `reason`. |
+| 422 | `ATTACHMENT_REFUSED` | Blocked type or failed scan. Nothing was sent. |
+| 429 | `RATE_LIMIT_EXCEEDED`, `QUOTA_EXCEEDED` | Wait for `retry-after`. |
+| 500, 503 | `INTERNAL_ERROR`, `SERVICE_UNAVAILABLE`, `ATTACHMENT_SCAN_UNAVAILABLE` | Retry with backoff. |

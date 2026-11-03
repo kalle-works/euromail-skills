@@ -8,12 +8,14 @@ Claude Code skills for [euromail.dev](https://euromail.dev) — GDPR-compliant t
 
 Integrates euromail.dev into any project end-to-end:
 
-1. Detects tech stack (Node.js, Python, Rust, Go)
-2. Installs the correct SDK
+1. Detects tech stack (Node.js, Python, Rust, Go, PHP, WordPress)
+2. Installs the correct SDK, or the WordPress plugin
 3. Resolves `EUROMAIL_API_KEY` from env, `.env`, or shell profiles
 4. Detects or adds a verified sending domain
 5. Sends a test email
 6. Writes a reusable email service module
+
+It also covers SMTP sending, the MCP server, signup forms and agent mailboxes, and points to the API reference served by euromail.dev.
 
 Works with Claude Code and other agents that support the SKILL.md standard (Cursor, Windsurf, Codex CLI).
 
