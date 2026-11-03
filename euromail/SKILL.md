@@ -4,8 +4,7 @@ description: |
   Add euromail.dev transactional email to any project. Detects tech stack,
   installs SDK, configures auth, and writes integration code. Also covers SMTP
   sending, the MCP server, signup forms, and agent mailboxes with
-  lease/ack/nack delivery, quote stripping, intent classification and spam
-  verdicts.
+  lease/ack/nack delivery, intent classification and spam verdicts.
   Use when: "add email", "send emails", "euromail",
   "transactional email", "integrate euromail", "signup form", "subscribe form",
   "agent mailbox", "inbound email for AI", "email for agent", "euromail smtp",
@@ -26,13 +25,9 @@ You are integrating euromail.dev — a GDPR-compliant transactional email API wi
 
 **Detect before asking.** At each step, exhaust all auto-detection options before prompting the user. The happy path should require zero user input. Only block on user input when the information is genuinely unavailable from the environment, files, or API.
 
-**Default test recipient**: Detect from the environment in this order — stop at the first hit:
-1. Git config: `git config user.email`
-2. `package.json` → `author.email` or `"author"` string
-3. `pyproject.toml` → `[project] authors`
-4. Ask the user: "What email should I send the test email to?"
+**Default test recipient**: `git config user.email`, which names the person running this. If it is empty, ask: "What email should I send the test email to?" Don't take an address from `package.json` or `pyproject.toml`: those name the package's author, who may be a stranger, and on a verified domain the mail really goes out.
 
-Never hardcode an email address. Always resolve it at runtime.
+**Never print the API key.** Everything a command prints ends up in the transcript and its logs, so check that a key exists without showing it.
 
 ## Workflow
 
@@ -90,37 +85,38 @@ No `composer.json` in the project? Fall back to raw HTTP with PHP's native HTTP 
 
 ### Step 3: Setup API Key
 
-**Auto-detect in this order — stop at the first hit:**
+**Auto-detect in this order, without printing the key — stop at the first hit:**
 
-1. Shell environment: `echo $EUROMAIL_API_KEY`
-2. Project `.env` file: `grep EUROMAIL_API_KEY .env 2>/dev/null`
-3. Project `.env.local`: `grep EUROMAIL_API_KEY .env.local 2>/dev/null`
-4. Shell profile: `grep EUROMAIL_API_KEY ~/.zshrc ~/.zprofile ~/.bashrc ~/.bash_profile 2>/dev/null | head -1`
-5. Global config file: `cat ~/.config/euromail/api_key 2>/dev/null`
+1. Shell environment: `[ -n "$EUROMAIL_API_KEY" ]`
+2. Project `.env`: `grep -qs '^EUROMAIL_API_KEY=' .env`
+3. Project `.env.local`: `grep -qs '^EUROMAIL_API_KEY=' .env.local`
+4. Shell profile: `grep -ls EUROMAIL_API_KEY ~/.zshrc ~/.zprofile ~/.bashrc ~/.bash_profile`
+5. Global config file: `[ -s ~/.config/euromail/api_key ]`
 
-If found anywhere **other than** the project `.env`, add it to `.env` so the project has a local copy.
+If it isn't found anywhere, ask the user:
 
-If not found anywhere, ask the user:
+> I couldn't find `EUROMAIL_API_KEY` in your environment or project files. Create one at https://dashboard.euromail.dev/api-keys and put it in your shell or in this project's `.env`, then tell me. Please don't paste it into this chat.
 
-> I couldn't find `EUROMAIL_API_KEY` in your environment or project files. Create one at https://dashboard.euromail.dev/api-keys and paste it here, or set `EUROMAIL_API_KEY=em_live_...` in your shell and re-run.
+A key in a file is not in the environment yet, and the commands below read the environment. Export it in the same command that uses it, since each shell command may start fresh:
 
-Once you have the key:
+```bash
+export EUROMAIL_API_KEY="$(sed -n 's/^EUROMAIL_API_KEY=//p' .env)"   # or .env.local
+```
 
-1. Add `EUROMAIL_API_KEY` to `.env` (create if missing, or add to existing):
-   ```
-   EUROMAIL_API_KEY=em_live_...
-   ```
-2. Add `.env` to `.gitignore` if not already there.
+For the project's own use, the key belongs in an ignored file:
+
+1. Leave a key that is already in `.env.local` where it is. Some frameworks commit `.env` and keep secrets in `.env.local`.
+2. Before writing to `.env`, check that it is untracked and ignored: `git ls-files --error-unmatch .env` must fail and `git check-ignore -q .env` must succeed. If `.env` is tracked, use `.env.local` and make sure that one is ignored.
 3. If `.env.example` exists, add `EUROMAIL_API_KEY=` (no value) there too.
 
 **Verify the key works:**
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}" https://api.euromail.dev/v1/account \
+curl -s -w '\n%{http_code}\n' https://api.euromail.dev/v1/account \
   -H "Authorization: Bearer $EUROMAIL_API_KEY"
 ```
 
-- `200`: the key works and has full access.
+- `200`: the key works and has `account:admin`.
 - `403` with code `INSUFFICIENT_SCOPE`: the key works but lacks `account:admin`. That is normal for a scoped key. The domain steps below need `domains:manage`, and the test send needs `emails:send`.
 - `401`: read `error.code`. `AUTH_MISSING` means nothing was sent, `AUTH_MALFORMED` means it isn't a key (the placeholder `em_live_...` counts), and `AUTH_INVALID_KEY` means it is mistyped or deleted. Ask the user to check it.
 
@@ -133,7 +129,7 @@ curl -s -o /dev/null -w "%{http_code}" https://api.euromail.dev/v1/account \
    curl -s https://api.euromail.dev/v1/domains \
      -H "Authorization: Bearer $EUROMAIL_API_KEY"
    ```
-   A domain whose `verified_at` is set is verified. Use it, no further setup needed, and skip to Step 5. Domains have no `verified` field.
+   A domain can send when `dkim_verified` and `return_path_verified` are both true. Use it, no further setup needed, and skip to Step 5. Domains have no `verified` field, and don't go by `verified_at`, which can lag behind the checks.
 
 2. Infer from `package.json` → `homepage` field (e.g. `https://app.example.com` → `example.com`)
 
@@ -208,19 +204,15 @@ Inbound needs a separate MX record on the address's domain (apex or whatever sub
 
 Warn the user: adding MX on the apex catches *all* `@their-domain.tld` inbound. If their team already receives mail at that domain (Google Workspace, Fastmail, etc.), use an inbound subdomain (`mail.their-domain.tld`, `inbound.their-domain.tld`) instead and register that as a separate euromail domain.
 
-After publishing, re-verify with the same `/v1/domains/{id}/verify` call. On success `mx_verified` flips to `true` and mailboxes / routes on that domain become available.
+After publishing, re-verify with the same `/v1/domains/{id}/verify` call. On success `mx_verified` flips to `true` and routes on that domain become available. A mailbox on the domain also needs `inbound_enabled`, which no API route sets: ask the user to turn on inbound for the domain in the dashboard.
 
 ### Step 5: Send Test Email
 
 Send a test email to verify the full pipeline works. Use the SDK (not curl) to validate the integration code works end-to-end.
 
-**Test recipient**: Resolve from the environment before writing the script:
-1. `git config user.email`
-2. `package.json` → `author.email` (or parse the `"author"` string)
-3. `pyproject.toml` → `[project] authors`
-4. If none found, ask the user: "What email should I send the test to?"
+**Test recipient**: `git config user.email`, or ask the user if that is empty.
 
-Write a small test script appropriate for the stack and run it (substitute the resolved email for `TEST_RECIPIENT`):
+Write a small test script appropriate for the stack and run it (substitute the resolved email for `TEST_RECIPIENT`, and export the key first as in Step 3):
 
 **TypeScript** — create `scripts/test-email.ts` (or `.js`):
 ```typescript
@@ -257,7 +249,7 @@ response = client.send_email(
 print(f"Email sent! ID: {response.id}, Status: {response.status}")
 ```
 
-**Rust** — create `examples/test_email.rs`:
+**Rust** — create `examples/test_email.rs`. It also needs `tokio = { version = "1", features = ["macros", "rt-multi-thread"] }`:
 ```rust
 use euromail::{EuroMail, SendEmailParams};
 
@@ -290,12 +282,12 @@ Generate an email service module appropriate for the stack. Use the examples and
 The module should include:
 - Client initialization from environment variable
 - A `sendEmail` / `send_email` function wrapping the SDK call
-- Error handling that branches on `error.code`, not on the message: fix-the-request errors (`VALIDATION_ERROR`, `RECIPIENT_SUPPRESSED`, `SENDER_DOMAIN_NOT_REGISTERED`) must not be retried, and `RATE_LIMIT_EXCEEDED` and `QUOTA_EXCEEDED` wait for `retry-after`. The Errors section has the table.
+- Error handling that does not retry a request that has to change (`VALIDATION_ERROR`, `RECIPIENT_SUPPRESSED`, `SENDER_DOMAIN_NOT_REGISTERED`) and waits for `retry-after` on a `429`. Never match on the message. The Errors section has the table and how each SDK exposes it.
 - An `idempotency_key` on sends a caller might retry, so a retry cannot send twice.
 
 ### Step 7: Cleanup & Next Steps
 
-1. Delete the test email script (or keep it if the user wants).
+1. Delete the test email script: it holds a real address.
 2. Show the user a summary of what was set up:
    - SDK installed
    - API key configured in `.env`
@@ -312,7 +304,7 @@ Then ask if they need:
 - Analytics integration
 - Inbound email handling (basic routes + webhooks)
 - The MCP server, so an assistant can send and manage email itself
-- Agent mailboxes (dedicated addresses for AI agents with lease/ack/nack delivery, intent classification, and threading). Two deployment shapes: bind the mailbox directly to the user's verified domain (`support@their-domain.tld`, clean, needs inbound MX on that domain — see Step 4e), or keep it on `@inbound.euromail.dev` and add an inbound route that forwards `something@their-domain.tld` → mailbox (no custom MX on the user's domain for the mailbox itself, but the *route*'s domain still needs MX). Prefer the first when practical.
+- Agent mailboxes (dedicated addresses for AI agents with lease/ack/nack delivery, intent classification, and threading). Two shapes: bind the mailbox to the user's verified domain (`support@their-domain.tld`, which needs inbound MX and inbound turned on, see Step 4e), or leave it on `@inbound.euromail.dev`, which needs no DNS. Inbound routes cannot deliver into a mailbox.
 
 Generate additional code as needed using the API reference below.
 
@@ -334,9 +326,9 @@ This file holds the workflow and what is easy to get wrong. The route list lives
 
 | What | Where |
 |------|-------|
-| Every route, generated from the server | `https://api.euromail.dev/api-docs/openapi.json` |
+| Every API route, generated from the server, and the authority where documents disagree | `https://api.euromail.dev/api-docs/openapi.json` |
 | The reference as one text file | `https://api.euromail.dev/llms-full.txt` |
-| Guides, per feature | `https://euromail.dev/docs/guides/` |
+| Guides, per feature (`/docs/guides/<name>/`, for example `signup-forms`, `agent-mailboxes`, `webhooks`) | `https://euromail.dev/docs/` |
 
 List the routes of one area, for example agent mailboxes:
 
@@ -392,7 +384,7 @@ const later = await euromail.sendEmail({
   to: "user@example.com",
   subject: "Reminder",
   text_body: "Don't forget!",
-  send_at: "2030-04-01T09:00:00Z",
+  send_at: new Date(Date.now() + 86_400_000).toISOString(), // tomorrow
 });
 await euromail.cancelScheduledEmail(later.id);
 
@@ -400,7 +392,9 @@ await euromail.cancelScheduledEmail(later.id);
 const domain = await euromail.addDomain("yourdomain.com");
 const verification = await euromail.verifyDomain(domain.id);
 
-// Webhook: the secret comes back only on create, so store it
+// Webhook: the secret comes back only on create, so store it.
+// The SDK's event type lacks failed, deferred and mailbox.message.received;
+// cast to subscribe to those.
 const webhook = await euromail.createWebhook({
   url: "https://yourapp.com/webhooks/euromail",
   events: ["sent", "bounced", "complained"],
@@ -412,7 +406,8 @@ function isGenuine(rawBody: string, header: string | null, secret: string): bool
   return verifyWebhookSignature(rawBody, header, secret);
 }
 
-// Agent mailbox: lease a message, work on it, then ack
+// Agent mailbox: lease a message, work on it, then ack. Delivery is at least
+// once, so skip a message id you have already answered.
 const mailbox = await euromail.createMailbox({ local_part: "support-bot", display_name: "Support Agent" });
 console.log(mailbox.address); // support-bot@inbound.euromail.dev
 
@@ -488,6 +483,10 @@ resp, err := client.SendEmail(ctx, euromail.SendEmailParams{
 	HTMLBody: euromail.String("<h1>Hello</h1>"),
 	TextBody: euromail.String("Hello"),
 })
+if err != nil {
+	return err
+}
+fmt.Println(resp.ID, resp.Status)
 ```
 
 Verify a webhook with `euromail.VerifyWebhookSignature(payload, header, secret)`.
@@ -529,7 +528,7 @@ Use SMTP for anything that has SMTP settings and no code to change. It goes thro
 Use this to let an assistant send and manage email itself rather than writing integration code. It needs Node.js 22 or newer.
 
 ```bash
-claude mcp add euromail --env EUROMAIL_API_KEY=em_live_your_key_here -- npx -y @euromail/mcp-server
+claude mcp add euromail --env EUROMAIL_API_KEY="$EUROMAIL_API_KEY" -- npx -y @euromail/mcp-server
 ```
 
 ---
@@ -540,7 +539,9 @@ claude mcp add euromail --env EUROMAIL_API_KEY=em_live_your_key_here -- npx -y @
 
 Subscribe to `sent` for delivery: it means the recipient's mail server accepted the message. `delivered` is a deprecated alias that is stored as `sent`, and it never fired on its own.
 
-**Signature**: `X-Euromail-Signature: t={unix_timestamp},v1={hex}`, where `v1` is `HMAC-SHA256(secret, "{t}.{raw_body}")`. Use the SDK's helper above where there is one. By hand: compare in constant time, reject a timestamp more than 5 minutes off, accept any `v1` in the header since a rotating secret can carry two, and hash the raw bytes before parsing the JSON.
+**Signature**: `X-Euromail-Signature: t={unix_timestamp},v1={hex}`, where `v1` is `HMAC-SHA256(secret, "{t}.{raw_body}")`. Use the SDK's helper above where there is one. By hand: compare in constant time, reject a timestamp more than 5 minutes off, and hash the raw bytes before parsing the JSON.
+
+**Rotating a secret**: each delivery is signed with one secret, so the receiver has to try both the old and the new one during the change. A `4xx` in that window is not retried.
 
 **Delivery**: `X-Euromail-Event` names the event and `X-Euromail-Attempt` counts from 1. A `4xx` from your endpoint is treated as permanent and not retried, so answer `5xx` for anything you want again.
 
@@ -548,14 +549,14 @@ Subscribe to `sent` for delivery: it means the recipient's mail server accepted 
 
 ## Inbound and agent mailboxes
 
-- **Addresses.** A mailbox is `<local_part>@inbound.euromail.dev` by default. Set `domain_id` to a domain with MX verified and inbound enabled to get `<local_part>@their-domain.tld`.
+- **Addresses.** A mailbox is `<local_part>@inbound.euromail.dev` by default. Set `domain_id` to a domain with `mx_verified` and `inbound_enabled` to get `<local_part>@their-domain.tld`.
 - **`domain_id` is the only domain field.** A plain string `domain` is ignored, and the mailbox lands on `inbound.euromail.dev` anyway. `address` is ignored too.
-- **Route patterns.** An exact-match route pattern must end with `@` (`"support@"`). The domain needs `mx_verified` before you can create routes on it.
-- **Route or mailbox?** To deliver `foo@their-domain.tld` into a queue, create the mailbox with `domain_id` and no route. Use a route to fan many addresses into one mailbox, to forward to a webhook, or to keep the mailbox on `@inbound.euromail.dev` behind a vanity address.
-- **Deleting a mailbox does not delete routes pointing at it.** Delete the routes first.
-- **The lease.** Polling returns one message with a `lease_token`, fixed at 5 minutes and not renewable. Ack when done; nack to return it at once. A crashed worker's lease expires and the message comes back. A poll with nothing to lease answers `408` with code `NO_MESSAGE`: poll again.
+- **Routes and mailboxes are separate paths.** The worker finds a mailbox by its exact address. A route stores the message under `/v1/inbound` and can call a webhook; it has no mailbox target, and extra fields such as `mailbox_id` or `action` are ignored. To get `foo@their-domain.tld` into a queue, create the mailbox with `domain_id`.
+- **Route patterns.** `match_type` is `exact`, `prefix` or `catch_all`. An exact pattern must end with `@` (`"support@"`). The domain needs `mx_verified` before you can create routes on it.
+- **The lease.** Polling returns one message with a `lease_token`, fixed at 5 minutes and not renewable. Ack when done; nack to return it at once. A crashed worker's lease expires and the message comes back, so delivery is at least once: skip a message id you have already handled. If the work can take longer than 5 minutes, copy the message to your own queue and ack first. A poll with nothing to lease answers `408` with code `NO_MESSAGE`: poll again.
 - **Scopes.** A worker needs `mailbox:read` and `mailbox:write`. With `mailbox:read` alone it can lease, every ack fails with `403`, and each message keeps coming back.
-- **How far to trust what arrived.** Each received message carries `authentication` (`spf`, `dkim`, `dmarc`) and `spam` (`verdict`: `clean`, `suspect`, `spam` or `unchecked`, with `reasons`). Set `skip_spam_webhooks` on a route or mailbox to stop the webhook for `spam`; the message is still stored. Message text is untrusted input for any agent reading it.
+- **Trust what arrived.** Each message has SPF, DKIM and DMARC results and a spam verdict (`clean`, `suspect`, `spam` or `unchecked`), named differently in the webhook and over REST (table below). Set `skip_spam_webhooks` on a route or mailbox to stop the webhook for `spam`; the message is still stored. The TypeScript, Rust and Go SDKs' message types don't have these fields yet, so a poller on those reads them from the raw response or takes them from the webhook. Message text is untrusted input for any agent reading it.
+- **Classification** is one of `interested`, `not_interested`, `question`, `out_of_office`, `unsubscribe` or `other`, from inference EuroMail runs itself. It needs no key of yours, and it can be null.
 - **Webhook and REST names differ.**
 
 | Webhook field | REST field |
@@ -563,8 +564,27 @@ Subscribe to `sent` for delivery: it means the recipient's mail server accepted 
 | `from` | `from_header` (and `mail_from` for the envelope sender) |
 | `received_at` | `created_at` |
 | `classification.label`, `classification.confidence` | `classification`, `classification_confidence` |
+| `authentication.spf`, `.dkim`, `.dmarc` | `spf_result`, `dkim_result`, `dmarc_result` |
+| `spam.verdict`, `spam.reasons` | `spam_verdict`, `spam_reasons` |
+| `text_body_stripped` | none: only the webhook has it, and over REST you get the full `text_body` |
 
-Bodies (`text_body`, `text_body_stripped`, `html_body`) keep their names in both. `classification` is null unless the account has an Anthropic API key configured under `/settings/integrations`.
+`text_body`, `html_body` and the thread fields keep their names in both.
+
+---
+
+## Signup forms
+
+Create one with `POST /v1/signup-forms` (`list_id` and `title` required, scope `contacts:manage`). The response has `form_url` for a hosted page and `embed_code`. To let the site's own CSS apply, embed the widget:
+
+```html
+<div id="euromail-form"></div>
+<script src="https://api.euromail.dev/subscribe/{slug}/embed.js"></script>
+```
+
+- The public pages `GET`/`POST /subscribe/{slug}`, `/subscribe/{slug}/embed.js` and `GET /confirm/{token}` are not in the OpenAPI document.
+- Every class is prefixed `em-form`: `.em-form`, `.em-form__title`, `.em-form__description`, `.em-form__field`, `.em-form__label`, `.em-form__input`, `.em-form__button`, `.em-form__message`, `.em-form__powered`.
+- To translate the form, set `messages`, whose keys are `submit_button`, `email_label`, `email_placeholder`, `submitting`, `already_subscribed`, `confirmation_sent`, `confirmation_pending`, `invalid_email` and `error`. An omitted key uses the English default.
+- Double opt-in, styling and the compliance checklist: `https://euromail.dev/docs/guides/signup-forms/`.
 
 ---
 
@@ -580,14 +600,14 @@ Bodies (`text_body`, `text_body_stripped`, `html_body`) keep their names in both
 |------------|-------|
 | Request body | 2 MB |
 | `html_body` / `text_body` | 256 KB each |
-| Subject | 998 characters |
+| Subject | 998 bytes |
 | Recipients (to + cc + bcc) | 50 per email |
-| Tags | 10 per email, 256 characters each |
-| Attachments | 10 per email, 10 MB each, 25 MB in all, and the request body limit applies |
-| Blocked attachment types | `.exe`, `.bat`, `.cmd`, `.scr`, `.com`, `.msi`, `.js`, `.vbs`, `.ws`, `.ps1` |
+| Tags | 10 per email, 256 bytes each |
+| Attachments | 10 per email, 10 MB each, 25 MB in all. The request body limit applies first, and base64 adds a third, so one tops out near 1.5 MB |
+| Blocked attachment types | executables and scripts, for example `.exe`, `.dll`, `.jar`, `.bat`, `.js`, `.ps1`, `.msi`. The real type is read from the content, and archives are opened, so renaming does not help |
 | Batch | 500 emails |
 | Scheduled ahead | 30 days |
-| Idempotency key | 255 characters |
+| Idempotency key | 255 bytes |
 | Template alias | letters, digits, hyphens and underscores, 100 characters |
 | Pagination | 25 per page by default, 100 at most |
 
@@ -607,7 +627,7 @@ Every attachment is also scanned for viruses. A refused one rejects the whole se
 | Monthly allowance | the plan's volume; 3,000 until a non-zero invoice has been paid |
 | Webhook tests | 5 a minute per webhook |
 
-Sandbox sends skip the send rate and the new-account allowance. In a batch, an email refused by these limits is listed in `errors` and `rate_limited` with `retry_after_seconds`, and the rest of the batch goes through.
+Sandbox sends skip the send rate and the new-account allowance. In a batch, an email refused by these limits is listed in `errors` and `rate_limited` with `retry_after_seconds`, and the rest of the batch goes through. If no email was accepted and every refusal is such a limit, the whole response is a `429`, which an SDK raises as an error.
 
 ---
 
@@ -623,7 +643,7 @@ Sandbox sends skip the send rate and the new-account allowance. In a batch, an e
 }
 ```
 
-Branch on `code`: it is stable. `message` is for people and can change. Some errors add `docs_url`. The full table with retry advice is at `https://euromail.dev/docs/guides/errors-and-rate-limits/`.
+Over raw HTTP, branch on `code`: it is stable. `message` is for people and can change. Some errors add `docs_url`. The full table with retry advice is at `https://euromail.dev/docs/guides/errors-and-rate-limits/`.
 
 | HTTP | `code` | Do |
 |------|--------|----|
@@ -634,7 +654,18 @@ Branch on `code`: it is stable. `message` is for people and can change. Some err
 | 408 | `NO_MESSAGE` | Mailbox long poll: poll again. |
 | 409 | `CONFLICT` | It already exists. |
 | 422 | `VALIDATION_ERROR` | Fix the request. This is also how an unverified domain sending to someone else is refused. |
-| 422 | `RECIPIENT_SUPPRESSED` | The address bounced, complained or unsubscribed. Do not retry; the body has `reason`. |
+| 422 | `RECIPIENT_SUPPRESSED` | The body's `reason` says why: `bounce`, `complaint`, `unsubscribe`, `duplicate_flood`, `inactive` or `manual`. Do not retry as it is. An `unsubscribe` does not block mail sent with `"transactional": true`, such as a receipt or a password reset. |
 | 422 | `ATTACHMENT_REFUSED` | Blocked type or failed scan. Nothing was sent. |
 | 429 | `RATE_LIMIT_EXCEEDED`, `QUOTA_EXCEEDED` | Wait for `retry-after`. |
 | 500, 503 | `INTERNAL_ERROR`, `SERVICE_UNAVAILABLE`, `ATTACHMENT_SCAN_UNAVAILABLE` | Retry with backoff. |
+
+**In an SDK**, the error's type tells you more than its code:
+
+| SDK | `401` | `429` | Everything else |
+|-----|-------|-------|-----------------|
+| TypeScript | `AuthenticationError` | `RateLimitError`, with `retryAfter` | `EuroMailError` with `status` and `code` |
+| Python | `AuthenticationError` | `RateLimitError`, with `retry_after` | `EuroMailError` with `status` and `code` |
+| Rust | `EuroMailError::Authentication` | `EuroMailError::RateLimit { retry_after, .. }` | `Validation { code, .. }`, `Api { status, code, .. }` |
+| Go | `AuthenticationError` | `RateLimitError`, with `RetryAfter` | `EuroMailError` with `Status` and `Code` |
+
+TypeScript and Python set a fixed code on `401` and `429`, and Rust's variants carry none there, so `RATE_LIMIT_EXCEEDED`, `QUOTA_EXCEEDED` and the `AUTH_*` codes can't be told apart in those three. The message says which it was, for a person to read.
